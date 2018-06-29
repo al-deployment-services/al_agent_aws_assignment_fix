@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Function to assign AlertLogic al-agent to appropriate default assignment policy per VPC
+Globals:
+  Function:
+    Timeout: 5
+Parameters:
+  pParentCID:
+    Description: Target AlertLogic Account ID that you wish to check
+    Type: String
+  pDatacenter:
+    Description: Data center location
+    Type: String
+    AllowedValues:
+      - "ASHBURN"
+      - "DENVER"
+      - "NEWPORT"
+  pUserName:
+    Description: User name to authenticate with Alert Logic portal (or API Access Key)
+    Type: String
+  pPassword:
+    Description: Password to authenticate with Alert Logic portal (or API Secret Key)
+    Type: 'String'
+    NoEcho: True
+  pDefenderKey:
+    Description: AlertLogic Cloud Defender API Key
+    Type: 'String'
+    NoEcho: True
+  pDryrun:
+    Description: Set this flag to True if you want to test without actually commiting any changes
+    Type: String
+    Default: "False"
+    AllowedValues:
+      - "True"
+      - "False"
+  pSourceS3Bucket:
+    Description: >
+      The prefix of the S3 bucket which contains Lambda package. Note that the name of the bucket must contain a region name suffix. The following is the valid backet name syntax: <bucket_name_prefix>.us-east-1.
+    Default: "al-deployment-services"
+    Type: String
+  pLambdaPackages:
+    Description: Lambda package which implement the function
+    Default: "al_agent_assignment.zip"
+    Type: String
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Account and Credentials"
+        Parameters:
+          - pParentCID
+          - pDatacenter
+          - pUserName
+          - pPassword
+          - pDefenderKey
+      -
+        Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - pDryrun
+          - pLambdaPackages
+          - pSourceS3Bucket
+    ParameterLabels:
+      pParentCID:
+        default: "Target CID (parent)"
+      pDatacenter:
+        default: "Data residency"
+      pUserName:
+        default: "Insight User name"
+      pPassword:
+        default: "Insight Password"
+      pDefenderKey:
+        default: "Defender API Key"
+      pDryrun:
+        default: "Enable Dry Run"
+      pLambdaPackages:
+        default: "Package name"
+      pSourceS3Bucket:
+        default: "Source S3 Bucket"
+Resources:
+  AgentAssignment:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri:
+        Bucket:
+          !Join
+            - '.'
+            - - !Ref 'pSourceS3Bucket'
+              - !Ref 'AWS::Region'
+        Key:
+          !Join
+            - '/'
+            - - 'lambda_packages'
+              - !Ref 'pLambdaPackages'
+      Handler: agent_assignment.lambda_handler
+      Runtime: python2.7
+      MemorySize: 512
+      Timeout: 300
+      Role: !GetAtt ImportFunctionRole.Arn
+      Environment:
+        Variables:
+          OUTPUT: !Ref OutputBucket
+          SECRET: !GetAtt EncryptedSecret.CipherText
+          PARENT_CID: !Ref pParentCID
+          DC: !Ref 'pDatacenter'
+          USER: !Ref 'pUserName'
+          DRY_RUN: !Ref 'pDryrun'
+      Events:
+        Timer:
+          Type: Schedule
+          Properties:
+            Schedule: rate(60 minutes)
+            Input: "{\"type\":\"check_assignment\", \"log_level\":\"info\"}"
+
+  Encrypt:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri:
+        Bucket:
+          !Join
+            - '.'
+            - - !Ref 'pSourceS3Bucket'
+              - !Ref 'AWS::Region'
+        Key:
+          !Join
+            - '/'
+            - - 'lambda_packages'
+              - 'encrypter.zip'
+      Handler: encrypter.lambda_handler
+      Runtime: python2.7
+      MemorySize: 128
+      Timeout: 10
+      KmsKeyArn: !GetAtt 'EncryptionKey.Arn'
+      Role: !GetAtt EncryptRole.Arn
+
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'Encryption key for secret config values for the Lambda function'
+      Enabled: True
+      EnableKeyRotation: True
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: 'key-default-1'
+        Statement:
+          -
+            Sid: 'Allow administration of the key & encryption of new values'
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - 'kms:Create*'
+              - 'kms:Encrypt'
+              - 'kms:Describe*'
+              - 'kms:Enable*'
+              - 'kms:List*'
+              - 'kms:Put*'
+              - 'kms:Update*'
+              - 'kms:Revoke*'
+              - 'kms:Disable*'
+              - 'kms:Get*'
+              - 'kms:Delete*'
+              - 'kms:ScheduleKeyDeletion'
+              - 'kms:CancelKeyDeletion'
+            Resource: '*'
+          -
+            Sid: 'Allow Lambda helper to encrypt using the key'
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt EncryptRole.Arn
+            Action:
+              - 'kms:Encrypt'
+            Resource: '*'
+          -
+            Sid: 'Allow Lambda function to decrypt using the key'
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ImportFunctionRole.Arn
+            Action:
+              - 'kms:Decrypt'
+            Resource: '*'
+
+  EncryptionKeyAlias:
+      Type: AWS::KMS::Alias
+      Properties:
+        AliasName: 'alias/EncryptionKey'
+        TargetKeyId: !Ref EncryptionKey
+
+  ImportFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: WriteToS3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Resource: !Join ['', ['arn:aws:s3:::', !Ref 'OutputBucket', '/*']]
+              Action: ["s3:PutObject"]
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  EncryptRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+
+  EncryptedSecret:
+    Type: 'AWS::CloudFormation::CustomResource'
+    Version: '1.0'
+    Properties:
+      ServiceToken: !GetAtt Encrypt.Arn
+      KeyId: !GetAtt EncryptionKey.Arn
+      PlainText:
+        Password: !Ref pPassword
+        DefenderKey: !Ref pDefenderKey
+
+  AgentAssignmentAlarm:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: AgentAssignmentErrorAlarm
+
+  FunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Error for AgentAssignment Lambda function
+      AlarmActions:
+        - !Ref AgentAssignmentAlarm
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: '3600'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AgentAssignment
+
+Outputs:
+  AgentAssignment:
+    Description: "Import AWS Tag Function ARN"
+    Value: !GetAtt AgentAssignment.Arn
+  AgentAssignmentAlarm:
+    Description: "Subscribe to this SNS to receive alarm"
+    Value: !Ref AgentAssignmentAlarm
